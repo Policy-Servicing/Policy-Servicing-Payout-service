@@ -28,6 +28,9 @@ public class SecurityConfig extends WebSecurityConfigurerAdapter {
                 // Public endpoints
                 .antMatchers("/api/v1/auth/login").permitAll()
                 .antMatchers("/actuator/health").permitAll()
+                // Swagger UI
+                .antMatchers("/v2/api-docs", "/configuration/ui", "/swagger-resources/**",
+                        "/configuration/security", "/swagger-ui.html", "/webjars/**").permitAll()
                 // Preflight
                 .antMatchers(HttpMethod.OPTIONS, "/**").permitAll()
                 // All other API requires auth
