@@ -2,10 +2,12 @@ package com.policyserve.service;
 
 import com.policyserve.dto.*;
 import com.policyserve.entity.PolicyTransaction;
+import com.policyserve.repository.OracleDashboardRepository;
 import com.policyserve.repository.PolicyTransactionRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
@@ -34,8 +36,20 @@ public class DashboardService {
         STAGE_META.put("PAID",        new String[]{"Paid",        "#10B981", "payments",    "0"});
     }
 
+    /**
+     * When true, stage counts and drill-down delegate to the Oracle DB package
+     * (PKG_PS_DASHBOARD) via OracleDashboardRepository.
+     * When false (default/dev), the existing JPA-based logic is used.
+     * Toggle via application.properties: app.use-oracle-package=true
+     */
+    @Value("${app.use-oracle-package:false}")
+    private boolean useOraclePackage;
+
     @Autowired
     private PolicyTransactionRepository txRepo;
+
+    @Autowired
+    private OracleDashboardRepository oracleRepo;
 
     // ── Modules ────────────────────────────────────────────────────────────────
 
@@ -84,8 +98,40 @@ public class DashboardService {
     // ── Stage Summary ──────────────────────────────────────────────────────────
 
     public StageSummaryDto getStageSummary(String module, String productId, String dateRange) {
-        log.info("getStageSummary: module={}, productId={}, dateRange={}", module, productId, dateRange);
+        log.info("getStageSummary: module={}, productId={}, dateRange={}, useOraclePackage={}",
+                module, productId, dateRange, useOraclePackage);
 
+        // ── Oracle Package path ─────────────────────────────────────────────
+        if (useOraclePackage) {
+            List<Map<String, Object>> oracleRows = oracleRepo.getStageCounts(module);
+            List<StageCountDto> stageCounts = oracleRows.stream().map(row -> {
+                String stage = String.valueOf(row.getOrDefault("stage_code", ""));
+                Number recCount = (Number) row.getOrDefault("rec_count", 0);
+                String[] meta = STAGE_META.getOrDefault(stage, new String[]{stage, "#6366F1", "info", "0"});
+                long count = recCount != null ? recCount.longValue() : 0L;
+                return StageCountDto.builder()
+                        .stage(stage)
+                        .label(String.valueOf(row.getOrDefault("stage_label", stage)))
+                        .color(meta[1])
+                        .icon(meta[2])
+                        .count(count)
+                        .previousCount(count > 0 ? (long)(count * 0.85) : 0L)
+                        .agingCount(0)
+                        .agingThresholdDays(0)
+                        .build();
+            }).collect(Collectors.toList());
+
+            long totalPending = stageCounts.stream()
+                    .filter(s -> !"PAID".equalsIgnoreCase(s.getStage()))
+                    .mapToLong(StageCountDto::getCount).sum();
+            return StageSummaryDto.builder()
+                    .module(module).productId(productId).dateRange(dateRange)
+                    .stageCounts(stageCounts).totalPending(totalPending)
+                    .totalAmount(null).slaBreaches(0).lastUpdated(LocalDateTime.now())
+                    .build();
+        }
+
+        // ── JPA fallback path (dev / no Oracle DB) ─────────────────────────
         List<StageCountDto> stageCounts = ALL_STAGES.stream().map(stage -> {
             String[] meta = STAGE_META.get(stage);
             int threshold = Integer.parseInt(meta[3]);
@@ -104,7 +150,7 @@ public class DashboardService {
                     .color(meta[1])
                     .icon(meta[2])
                     .count(count)
-                    .previousCount(count > 0 ? (long) (count * 0.85) : 0L) // simulated delta
+                    .previousCount(count > 0 ? (long) (count * 0.85) : 0L)
                     .agingCount(agingCount)
                     .agingThresholdDays(threshold)
                     .build();
@@ -113,18 +159,13 @@ public class DashboardService {
         long totalPending = stageCounts.stream()
                 .filter(s -> !s.getStage().equals("PAID"))
                 .mapToLong(StageCountDto::getCount).sum();
-
-        int slaBreaches = stageCounts.stream().mapToInt(s -> s.getAgingCount() != null ? s.getAgingCount() : 0).sum();
+        int slaBreaches = stageCounts.stream()
+                .mapToInt(s -> s.getAgingCount() != null ? s.getAgingCount() : 0).sum();
 
         return StageSummaryDto.builder()
-                .module(module)
-                .productId(productId)
-                .dateRange(dateRange)
-                .stageCounts(stageCounts)
-                .totalPending(totalPending)
-                .totalAmount(null) // aggregate amount can be wired via a native query later
-                .slaBreaches(slaBreaches)
-                .lastUpdated(LocalDateTime.now())
+                .module(module).productId(productId).dateRange(dateRange)
+                .stageCounts(stageCounts).totalPending(totalPending)
+                .totalAmount(null).slaBreaches(slaBreaches).lastUpdated(LocalDateTime.now())
                 .build();
     }
 
@@ -132,8 +173,40 @@ public class DashboardService {
 
     public DrillDownResponseDto getDrillDown(String stage, String module,
                                              String productId, int page, int size) {
-        log.info("getDrillDown: stage={}, module={}, productId={}, page={}, size={}", stage, module, productId, page, size);
+        log.info("getDrillDown: stage={}, module={}, productId={}, page={}, size={}, useOraclePackage={}",
+                stage, module, productId, page, size, useOraclePackage);
 
+        // ── Oracle Package path ─────────────────────────────────────────────
+        if (useOraclePackage) {
+            // Oracle pages from 1; Spring pages from 0 — convert
+            Map<String, Object> oracleResult = oracleRepo.getStageDrilldown(module, stage, page + 1, size);
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> rawRecords =
+                    (List<Map<String, Object>>) oracleResult.getOrDefault("records", Collections.emptyList());
+
+            List<PolicyRecordDto> records = rawRecords.stream().map(row ->
+                PolicyRecordDto.builder()
+                    .policyNo(str(row, "policy_no"))
+                    .productId(str(row, "product_id"))
+                    .moduleCode(module)
+                    .holderName(str(row, "holder_name"))
+                    .stage(stage)
+                    .amount(row.get("amount") instanceof Number
+                            ? new java.math.BigDecimal(row.get("amount").toString()) : null)
+                    .enteredAt(null)   // date columns returned as String; map as needed
+                    .agingDays(null)
+                    .status(str(row, "status"))
+                    .remarks(str(row, "remarks"))
+                    .build()
+            ).collect(Collectors.toList());
+
+            long total = ((Number) oracleResult.getOrDefault("totalCount", 0L)).longValue();
+            return DrillDownResponseDto.builder()
+                    .stage(stage).records(records).totalCount(total).page(page).size(size)
+                    .build();
+        }
+
+        // ── JPA fallback path ──────────────────────────────────────────────
         PageRequest pageable = PageRequest.of(page, size, Sort.by(Sort.Direction.DESC, "enteredAt"));
 
         Page<PolicyTransaction> resultPage = (productId != null && !productId.isEmpty())
@@ -156,12 +229,30 @@ public class DashboardService {
         ).collect(Collectors.toList());
 
         return DrillDownResponseDto.builder()
-                .stage(stage)
-                .records(records)
-                .totalCount(resultPage.getTotalElements())
-                .page(page)
-                .size(size)
+                .stage(stage).records(records)
+                .totalCount(resultPage.getTotalElements()).page(page).size(size)
                 .build();
+    }
+
+    // ── Audit Logs (Oracle only) ─────────────────────────────────────────────
+
+    /**
+     * Returns recent PS_API_CALL_LOG entries from the Oracle DB.
+     * Only meaningful when useOraclePackage=true.
+     */
+    public List<Map<String, Object>> getAuditLogs(String moduleCode, int limit) {
+        if (!useOraclePackage) {
+            log.warn("getAuditLogs called but app.use-oracle-package=false — returning empty list");
+            return Collections.emptyList();
+        }
+        return oracleRepo.getAuditLogs(moduleCode, limit);
+    }
+
+    // ── Private Helper ──────────────────────────────────────────────────────
+
+    private String str(Map<String, Object> row, String key) {
+        Object v = row.get(key);
+        return v != null ? v.toString() : null;
     }
 
     // ── Trend ─────────────────────────────────────────────────────────────────

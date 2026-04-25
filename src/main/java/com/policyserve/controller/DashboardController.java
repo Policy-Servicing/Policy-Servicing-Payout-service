@@ -7,6 +7,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
+import java.util.Map;
 
 @RestController
 @RequestMapping("/api/v1/dashboard")
@@ -54,5 +55,17 @@ public class DashboardController {
             @RequestParam(defaultValue = "SB") String module,
             @RequestParam(defaultValue = "7")  int    days) {
         return ResponseEntity.ok(dashboardService.getTrend(module, days));
+    }
+
+    /**
+     * GET /api/v1/dashboard/audit-logs?module=SB&limit=50
+     * Returns recent PKG_PS_DASHBOARD procedure call logs from PS_API_CALL_LOG.
+     * Requires app.use-oracle-package=true in application.properties to return data.
+     */
+    @GetMapping("/audit-logs")
+    public ResponseEntity<List<Map<String, Object>>> getAuditLogs(
+            @RequestParam(required = false)     String module,
+            @RequestParam(defaultValue = "100") int    limit) {
+        return ResponseEntity.ok(dashboardService.getAuditLogs(module, limit));
     }
 }
